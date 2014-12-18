@@ -2,6 +2,7 @@
 
 require 'rubygems'
 require 'uri'
+require 'cgi'
 require 'bio'
 require 'json'
 require 'securerandom'
@@ -52,6 +53,7 @@ module RDFSupport
       triple("@prefix", "rdfs:", "<http://www.w3.org/2000/01/rdf-schema#>"),
       #triple("@prefix", "dcterms:", "<http://purl.org/dc/terms/>"),
       triple("@prefix", "xsd:", "<http://www.w3.org/2001/XMLSchema#>"),
+      triple("@prefix", "skos:", "<http://www.w3.org/2004/02/skos/core#>"),
       triple("@prefix", "sio:", "<http://semanticscience.org/resource/>"),
       #triple("@prefix", "so:", "<http://purl.org/obo/owl/SO#>"),
       triple("@prefix", "obo:", "<http://purl.obolibrary.org/obo/>"),
@@ -65,7 +67,7 @@ module RDFSupport
 end
 
 ###
-### Mapping INSDC or RefSeq db_xref to Identifiers.org
+### Mapping of INSDC or RefSeq db_xref to Identifiers.org URI
 ###
 
 # https://gist.github.com/3985701
@@ -89,7 +91,7 @@ class RS_ID
 end
 
 ###
-### Mapping INSDC or RefSeq feature table to Sequence Ontology
+### Mapping of INSDC or RefSeq feature table to Sequence Ontology
 ###
 
 # https://gist.github.com/3650401
@@ -131,6 +133,12 @@ class FT_SO
       return hash["ft_desc"]
     end
   end
+
+  def ft_id(feature)
+    if hash = @data[feature]
+      return hash["ft_id"]
+    end
+  end
 end
 
 ###
@@ -146,6 +154,13 @@ class INSDC2RDF
     @seqtype = opts[:seqtype]
     @rs_id = RS_ID.new
     @ft_so = FT_SO.new
+
+    case @datasource
+    when /RefSeq/i
+      @entry_prefix = "http://identifiers.org/refseq/"
+    else # /INSDC|GenBank|ENA|DDBJ/i
+      @entry_prefix = "http://identifiers.org/insdc/"
+    end
 
     @gene = {}
     @xref_warn = {}
@@ -169,8 +184,9 @@ class INSDC2RDF
     @prefix = default_prefix + [
       #triple("@prefix", "genome:", "<http://purl.jp/bio/10/genome/>"),
       #triple("@prefix", "insdc:", "<http://insdc.org/owl/>"),
-      triple("@prefix", "insdc:", "<http://ddbj.nig.ac.jp/ontologies/sequence/>"),
-      triple("@prefix", "entry:", "<http://identifiers.org/#{@datasource}/>"),  # can be 'insdc' or 'refseq'
+      triple("@prefix", "insdc:", "<http://ddbj.nig.ac.jp/ontologies/nucleotide/>"),
+      triple("@prefix", "insdcdiv:", "<http://ddbj.nig.ac.jp/ontologies/nucleotide/Division#>"),
+      triple("@prefix", "insdcref:", "<http://ddbj.nig.ac.jp/ontologies/nucleotide/reference#>"),
     ]
   end
 
@@ -193,7 +209,8 @@ class INSDC2RDF
       uri = "<#{hash['prefix']}/#{id}>"
       puts triple(subject, "rdfs:seeAlso", uri)
       puts triple(uri, "rdfs:label", quote(id))
-      puts triple(uri, "sio:SIO_000068", "<#{hash['prefix']}>")  # sio:is-part-of
+      puts triple(uri, "rdf:type", "insdc:#{hash['class']}")
+      puts triple(uri, "sio:SIO_000068", "<#{hash['prefix']}>") + "  # sio:is-part-of"
     else
       unless @xref_warn[db]
         $stderr.puts "Error: New database '#{db}' found. Add it to the rs_id.json file and/or Identifiers.org."
@@ -206,93 +223,105 @@ class INSDC2RDF
   ### FALDO http://biohackathon.org/faldo
   ###
 
-  def new_feature_uri(so, from, to, strand)
-    "entry:#{@entry.acc_version}#feature:#{so}:#{from}-#{to}:#{strand}"
+  def new_feature_uri(feature, from, to, strand, count = false)
+    if count
+      "<#{@sequence_id}#feature:#{from}-#{to}:#{strand}:#{feature}.#{count}>"
+    else
+      "<#{@sequence_id}#feature:#{from}-#{to}:#{strand}:#{feature}>"
+    end
   end
 
-  def new_region_uri(so, from, to, strand)
-    "entry:#{@entry.acc_version}#region:#{so}:#{from}-#{to}:#{strand}"
+  def new_region_uri(from, to, strand)
+    "<#{@sequence_id}#region:#{from}-#{to}:#{strand}>"
   end
 
   def new_position_uri(pos, strand)
-    "entry:#{@entry.acc_version}#position:#{pos}:#{strand}"
+    "<#{@sequence_id}#position:#{pos}:#{strand}>"
   end
 
-  def new_location(pos, feature_type = {:id => "SO:0000001", :term => "region"})
-    @locations = Bio::Locations.new(pos)
+  def new_location(object, pos)
+    puts triple(object, "insdc:location", quote(pos))
+    locations = Bio::Locations.new(pos)
 
-    min, max = @locations.span
-    strand = @locations.first.strand
-
-    pos_begin =	new_position_uri(min, @locations.first.strand)
-    pos_end = new_position_uri(max, @locations.last.strand)
-    loc_id = new_region_uri(feature_type[:id], min, max, strand)
-
-    puts triple(loc_id, "insdc:location", quote(pos))
-    puts triple(loc_id, "rdf:type", "faldo:Region")
-    puts triple(loc_id, "faldo:begin", pos_begin)
-    puts triple(loc_id, "faldo:end", pos_end)
-
-    fuzzy_first = @locations.first.lt or @locations.last.gt
-    fuzzy_last = @locations.last.lt or @locations.last.gt
-    
-    # join(<1,60..99,161..241,302..370,436..594,676..887,993..1141,1209..1329,1387..1559,1626..1646,1708..>1843)
-    # [TODO] Note that positions of an object located over the origin can be faldo:begin > faldo:end
+    # [TODO] annotation located over the origin of a circular genome can be faldo:begin > faldo:end even in ForwardStrandPosition
     # e.g., join(800..900,1000..1024,1..234) will be faldo:begin 800 and faldo:end 234
-    new_stranded_positions(pos_begin, pos_end, @locations.first.from, @locations.last.to, strand, fuzzy_first, fuzzy_last)
-
-    list = []
-    count = 1
-    # [TODO] need to confirm that if there are any features having subparts (except for genes)
-    if feature_type[:term] == "exon"
-      @locations.each do |loc|
-        subpart_id = new_uuid
-        exon_id = new_region_uri(feature_type[:id], loc.from, loc.to, loc.strand)
-        subpart_begin = new_position_uri(loc.from, loc.strand)
-        subpart_end = new_position_uri(loc.to, loc.strand)
-
-        #puts triple(subpart_id, "obo:so_part_of", loc_id)
-        puts triple(subpart_id, "sio:SIO_000300", count)    # sio:has-value
-        puts triple(subpart_id, "sio:SIO_000628", exon_id)   # sio:referes-to
-
-        puts triple(subpart_id, "rdf:type", feature_type[:id]) + "  # #{feature_type[:term]}"
-        puts triple(subpart_id, "rdf:type", "faldo:Region")
-        puts triple(subpart_id, "faldo:begin", subpart_begin)
-        puts triple(subpart_id, "faldo:end", subpart_end)
-        new_stranded_positions(subpart_begin, subpart_end, loc.from, loc.to, loc.strand)
-        list << subpart_id
-        count += 1
-      end
-    end
-
-    return loc_id, list
-  end
-
-  def new_stranded_positions(pos_begin, pos_end, from, to, strand, fuzzy_from = nil, fuzzy_to = nil)
+    min, max = locations.span
+    strand = locations.first.strand
     if strand > 0
-      new_position(pos_begin, from, "faldo:ForwardStrandPosition", fuzzy_from)
-      new_position(pos_end, to, "faldo:ForwardStrandPosition", fuzzy_to)
+      fuzzy_min = locations.first.lt
+      fuzzy_max = locations.last.gt
+      strand_min = locations.first.strand
+      strand_max = locations.last.strand
     else
-      new_position(pos_begin, to, "faldo:ReverseStrandPosition", fuzzy_to)
-      new_position(pos_end, from, "faldo:ReverseStrandPosition", fuzzy_from)
+      fuzzy_min = locations.last.lt
+      fuzzy_max = locations.first.gt
+      strand_min = locations.last.strand
+      strand_max = locations.first.strand
     end
+    region_id = new_faldo_region(object, min, max, strand_min, strand_max, fuzzy_min, fuzzy_max)
+
+    return region_id, locations
   end
 
-  def new_position(pos_id, pos, strand, fuzzy = nil)
+  def add_subparts(locations, feature_type)
+    count = 1
+    sub_parts = []
+    sub_ordered_parts = []
+    locations.each do |loc|
+      subpart_id = new_uuid
+      subfeature_id = new_feature_uri(feature_type[:term], loc.from, loc.to, loc.strand)
+
+      #puts triple(subpart_id, "obo:so_part_of", region_id)
+      puts triple(subpart_id, "sio:SIO_000300", count) + "  # sio:has-value"
+      puts triple(subpart_id, "sio:SIO_000628", subfeature_id) + "  # sio:refers-to"
+      puts triple(subfeature_id, "rdf:type", "insdc:#{feature_type[:ft]}")
+      puts triple(subfeature_id, "rdfs:subClassOf", feature_type[:id]) + "  # SO:#{feature_type[:term]}"
+      new_faldo_region(subfeature_id, loc.from, loc.to, loc.strand, loc.strand, loc.lt, loc.gt)
+      sub_parts << subfeature_id
+      sub_ordered_parts << subpart_id
+      count += 1
+    end
+    return [sub_parts, sub_ordered_parts]
+  end
+
+  def new_faldo_region(object, min, max, strand_min, strand_max, fuzzy_min = nil, fuzzy_max = nil)
+    region_id = new_region_uri(min, max, strand_min)
+    region_min = new_position_uri(min, strand_min)
+    region_max = new_position_uri(max, strand_max)
+
+    puts triple(object, "faldo:location", region_id)
+    puts triple(region_id, "rdf:type", "faldo:Region")
+    if strand_min > 0
+      puts triple(region_id, "faldo:begin", region_min)
+      puts triple(region_id, "faldo:end", region_max)
+      new_faldo_position(region_min, min, "faldo:ForwardStrandPosition", fuzzy_min)
+      new_faldo_position(region_max, max, "faldo:ForwardStrandPosition", fuzzy_max)
+    else
+      puts triple(region_id, "faldo:begin", region_max)
+      puts triple(region_id, "faldo:end", region_min)
+      new_faldo_position(region_min, min, "faldo:ReverseStrandPosition", fuzzy_min)
+      new_faldo_position(region_max, max, "faldo:ReverseStrandPosition", fuzzy_max)
+    end
+
+    return region_id
+  end
+
+  def new_faldo_position(pos_id, pos, strand, fuzzy = nil)
     puts triple(pos_id, "faldo:position", pos)
-    puts triple(pos_id, "faldo:reference", @sequence_id)
+    puts triple(pos_id, "faldo:reference", @sequence_uri)
+    puts triple(pos_id, "rdf:type", strand)
     if fuzzy
       puts triple(pos_id, "rdf:type", "faldo:FuzzyPosition")
     else
       puts triple(pos_id, "rdf:type", "faldo:ExactPosition")
     end
-    puts triple(pos_id, "rdf:type", strand)
   end
 
   ###
   ### Main
   ###
 
+  # [TODO] rewrite parse_entry and subsequent methods to use Bio::Sequence for EMBL support
   def parse_entry(io)
     # Read INSDC or RefSeq entry
     Bio::FlatFile.auto(io).each do |entry|
@@ -311,25 +340,33 @@ class INSDC2RDF
   ###
 
   # [TODO]
-  # * bind sequences by BioProject ID?
-  # * flag complete/draft?
+  # * bind multiple sequences by BioProject ID?
+  # * add a flag for sequencing status representing complete/draft?
   def parse_sequence
-    @sequence_id = "entry:#{@entry.acc_version}"
+    @sequence_id = "#{@entry_prefix}#{@entry.acc_version}"
+    @sequence_uri = "<#{@sequence_id}#sequence>"
+    @entry_uri = "<#{@sequence_id}>"
 
-    # [TODO] How to identify the input is chromosome/plasmid/contig/...?
-    sequence_type(@seqtype)
-    # [TODO] Obtain rdfs:label from source /chromosome (eukaryotes) /plasmid (prokaryotes) -> see insdc:source_chromosome, insdc:source_plasmid
+    puts triple(@entry_uri, "rdf:type", "insdc:Entry")
+
+    # [TODO] obtain rdfs:label from source /chromosome (eukaryotes) /plasmid (prokaryotes) -> see insdc:source_chromosome, insdc:source_plasmid
     sequence_label(@entry.definition)
     sequence_version(@entry.acc_version)
-    sequence_length(@entry.nalen)
-    # [TODO] provide REST API to retreive genomic DNA sequence by <@sequence_id.fasta>
-    sequence_seq(@entry.acc_version)
-    sequence_form(@entry.circular)
-    # [TODO] sequenced date, modified in the source db or in our RDF data?
+    # [TODO] sequenced date: updated date in the source DB or generation date of the RDF data?
     sequence_date(@entry.date)
+    # [TODO] find appropriate REST URI to retreive genomic DNA sequence by <@sequence_id.fasta>
+    sequence_seq(@entry.acc_version)
+    # [TODO] how to automatically identify the input is chromosome/plasmid/contig/...?
+    sequence_type(@seqtype)
+    sequence_length(@entry.nalen)
+    sequence_form(@entry.circular)
+    sequence_division(@entry.division)
     # [TODO] rdfs:seeAlso (like UniProt) or dc:relation, owl:sameAs
-    sequence_link_gi(@entry.gi.sub('GI:',''))
-    sequence_link_accver(@entry.acc_version)
+    if @entry.gi[/GI:/]
+      sequence_link_gi(@entry.gi.sub('GI:',''))
+    end
+    sequence_link_accession(@entry.accession, @datasource)
+    sequence_link_accver(@entry.acc_version, @datasource)
     if bioproject = @entry.bioproject
       sequence_link_bioproject(bioproject)
     elsif project = @entry.project
@@ -338,103 +375,183 @@ class INSDC2RDF
     if biosample = @entry.biosample
       sequence_link_biosample(biosample)
     end
+    sequence_keywords(@entry.keywords)
+    sequence_source(@entry.source)
     # [TODO] how to deal with direct submissions (references without PMID)?
-    sequence_ref(@entry.references)
+    sequence_references(@entry.references)
+    sequence_comment(@entry.comment)
   end
 
   def sequence_type(so = "SO:sequence")
     case so
     when /0000001/, "SO:region", "SO:sequence"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000001") + "  # SO:sequence"
-    when /0000340/, "SO:chromosome"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000340") + "  # SO:chromosome"
-    when /0000155/, "SO:plasmid"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000155") + "  # SO:plasmid"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000001") + "  # SO:sequence"
+    when /0000340/, "SO:chromosome", "Chromosome", "Gapless Chromosome"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000340") + "  # SO:chromosome"
+    when /0000155/, "SO:plasmid", "Plasmid", "Mitochondrial Plasmid"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000155") + "  # SO:plasmid"
+    when /0000819/, "SO:mitochondrial_chromosome", "Mitochondrion"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000819") + "  # SO:mitochondrial_chromosome"
+    when /0000820/, "SO:chloroplast_chromosome", "Chloroplast"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000820") + "  # SO:chloroplast_chromosome"
+    when /0000745/, "SO:chloroplast_sequence"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000745") + "  # SO:chloroplast_sequence"
+    when /0000740/, "SO:plastid_sequence", "Plastid"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000740") + "  # SO:plastid_sequence"
+    when /0001041/, "SO:viral_sequence", "Virus", "Virus Chromosome", "Provirus Chromosome"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0001041") + "  # SO:viral_sequence"
+    when /0001259/, "SO:apicoplast_chromosome", "Apicoplast"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0001259") + "  # SO:apicoplast_chromosome"
+    when /0000743/, "SO:apicoplast_sequence"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000743") + "  # SO:apicoplast_sequence"
     when /0000736/, "SO:organelle_sequence"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000736") + "  # SO:organelle_sequence"
-    when /0000819/, "SO:mitochondrial_chromosome"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000819") + "  # SO:mitochondrial_chromosome"
-    when /0000740/, "SO:plastid_sequence"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000740") + "  # SO:plastid_sequence"
-    when /0000719/, "SO:ultracontig"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000719") + "  # SO:ultracontig"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000736") + "  # SO:organelle_sequence"
+    when /0000353/, "SO:biological_region", "Extrachromosal Element", "Non-nuclear Miscellaneous"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000353") + "  # SO:biological_region"
+    when /0000018/, "SO:linkage_group", "Linkage Group"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000018") + "  # SO:SO:linkage_group"
+    when /0000719/, "SO:ultracontig", "Chromosome with gaps"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000719") + "  # SO:ultracontig"
     when /0000148/, "SO:supercontig", "SO:scaffold"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000148") + "  # SO:supercontig/scaffold"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000148") + "  # SO:supercontig/scaffold"
     when /0000149/, "SO:contig"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000149") + "  # SO:contig"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000149") + "  # SO:contig"
     else
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000353") + "  # SO:sequence_assembly"
+      puts triple(@sequence_uri, "rdfs:subClassOf", "obo:SO_0000353") + "  # SO:sequence_assembly"
     end
   end
 
   def sequence_label(str)
     # Use "name:" key in the JSON representation
-    puts triple(@sequence_id, "rdfs:label", quote(str))
+    puts triple(@entry_uri, "insdc:definition", quote(str))
+    puts triple(@entry_uri, "rdfs:label", quote(str))
   end
 
   def sequence_version(str)
-    puts triple(@sequence_id, "insdc:sequence_version", quote(str))
+    puts triple(@entry_uri, "insdc:sequence_version", quote(str))
   end
 
   def sequence_length(int)
-    puts triple(@sequence_id, "insdc:sequence_length", int)
+    puts triple(@sequence_uri, "insdc:sequence_length", int)
   end
 
-  def sequence_seq(str)
-    # [TODO] Where to privide the actual DNA sequence?
-    fasta_uri = "<http://togows.org/entry/nucleotide/#{str}.fasta>"
-    #fasta_uri = "<http://www.ncbi.nlm.nih.gov/nuccore/#{str}?report=fasta>"
-    puts triple(@sequence_id, "insdc:sequence_fasta", fasta_uri)
+  def sequence_seq(entry_id)
+    puts triple(@entry_uri, "insdc:sequence", @sequence_uri)
+    # [TODO] where to obtain the actual DNA sequence? in what format?
+    #puts triple(@sequence_uri, "rdfs:seeAlso", "<http://togows.org/entry/nucleotide/#{entry_id}.fasta>")
+    puts triple(@sequence_uri, "rdfs:seeAlso", "<http://www.ncbi.nlm.nih.gov/nuccore/#{entry_id}?report=fasta>")
+    case @datasource
+    when /INSDC|GenBank|ENA|DDBJ/i
+      #puts triple(@sequence_uri, "rdfs:seeAlso", "<http://togows.org/entry/embl/#{entry_id}.fasta>")
+      puts triple(@sequence_uri, "rdfs:seeAlso", "<http://www.ebi.ac.uk/ena/data/view/#{entry_id}&display=fasta>")
+      #puts triple(@sequence_uri, "rdfs:seeAlso", "<http://togows.org/entry/ddbj/#{entry_id}.fasta>")
+      puts triple(@sequence_uri, "rdfs:seeAlso", "<http://getentry.ddbj.nig.ac.jp/getentry/na/#{entry_id}?format=fasta>")
+    end
   end
 
   def sequence_form(form)
     case form
     when "linear"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000987") + "  # SO:linear"
+      puts triple(@sequence_uri, "insdc:topology", "insdc:linear")
+      puts triple(@sequence_uri, "obo:so_has_quality", "obo:SO_0000987") + "  # SO:linear"
     when "circular"
-      puts triple(@sequence_id, "rdf:type", "obo:SO_0000988") + "  # SO:circular"
+      puts triple(@sequence_uri, "insdc:topology", "insdc:circular")
+      puts triple(@sequence_uri, "obo:so_has_quality", "obo:SO_0000988") + "  # SO:circular"
     end
   end
 
+  def sequence_division(division)
+    # [TODO] Change to use classes which will be defined in INSDC/DDBJ ontology
+    puts triple(@entry_uri, 'insdc:division', "insdcdiv:#{division}")
+  end
+
   def sequence_date(date)
-    puts triple(@sequence_id, "insdc:sequence_date", quote(usdate2date(date))+"^^xsd:date")
+    puts triple(@entry_uri, "insdc:sequence_date", quote(usdate2date(date))+"^^xsd:date")
   end
 
   def sequence_link_gi(str)
-    xref(@sequence_id, 'GI', str)
+    xref(@entry_uri, 'GI', str)
+  end
+
+  def sequence_link_accession(str, source_db = 'RefSeq')
+    xref(@entry_uri, source_db, str)
   end
 
   def sequence_link_accver(str, source_db = 'RefSeq')
-    # [TODO] distinguish RefSeq/GenBank/DDBJ entries by the prefix of accession IDs
+    # [TODO] automatically distinguish RefSeq/GenBank/DDBJ entries by the prefix of accession IDs?
     # [TODO] register GenBank/DDBJ in rs_id.json to enable the above
-    # [TODO] rewrite parse_entry and subsequent methods to use Bio::Sequence for EMBL support
-    xref(@sequence_id, source_db, str)
+    xref(@entry_uri, source_db, str)
   end
 
   def sequence_link_bioproject(str)
     id_pfx = "http://identifiers.org/bioproject"
     xref_id = "<#{id_pfx}/#{str}>"
-    puts triple(@sequence_id, 'insdc:dblink', xref_id)
+    puts triple(@entry_uri, 'insdc:dblink', xref_id)
     puts triple(xref_id, 'rdfs:label', quote(str))
-    puts triple(xref_id, 'rdf:type', "<#{id_pfx}#Entry>")
+    puts triple(xref_id, 'rdf:type', "insdc:BioProject")
+    puts triple(xref_id, 'sio:SIO_000068', "<#{id_pfx}>") + "  # sio:is-part-of"
   end
 
   def sequence_link_biosample(str)
     id_pfx = "http://identifiers.org/biosample"
     xref_id = "<#{id_pfx}/#{str}>"
-    xred_type = "<#{id_pfx}#Entry>"
-    puts triple(@sequence_id, 'insdc:dblink', xref_id)
+    puts triple(@entry_uri, 'insdc:dblink', xref_id)
     puts triple(xref_id, 'rdfs:label', quote(str))
-    puts triple(xred_id, 'rdf:type', xref_type)
+    puts triple(xref_id, 'rdf:type', "insdc:BioSample")
+    puts triple(xref_id, 'sio:SIO_000068', "<#{id_pfx}>") + "  # sio:is-part-of"
   end
 
-  def sequence_ref(refs)
-    refs.each do |ref|
-      pmid = ref.pubmed
-      if pmid.length > 0
-        xref(@sequence_id, 'PubMed', pmid)
-      end
+  def sequence_keywords(keywords)
+    # [TODO] change to use controlled vocabulary in the INSDC/DDBJ ontology
+    keyword_prefix = "http://ddbj.nig.ac.jp/ontologies/nucleotide/Keyword#"
+    keywords.each do |keyword|
+      name = quote(keyword).sub(/^"/, '').sub(/"$/, '')
+      puts triple(@entry_uri, 'insdc:keyword', "<#{keyword_prefix}#{CGI.escape(name)}>")
+      puts triple("<#{keyword_prefix}#{CGI.escape(name)}>", 'rdfs:label', quote(name))
     end
+  end
+
+  def sequence_source(source)
+    puts triple(@entry_uri, 'insdc:source', quote(source["common_name"]))
+    puts triple(@entry_uri, 'insdc:organism', quote(source["organism"]))
+    puts triple(@entry_uri, 'insdc:taxonomy', quote(source["taxonomy"]))
+  end
+
+  def sequence_references(references)
+    count = 1
+    references.each do |ref|
+      @reference_uri = new_reference_uri(count)
+      puts triple(@entry_uri, 'insdc:reference', @reference_uri)
+      puts triple(@reference_uri, 'sio:SIO_000300', count) + "  # sio:has-value"
+      puts triple(@reference_uri, 'insdcref:title', quote(ref.title)) if ref.title
+      ref.authors.each do |author|
+        puts triple(@reference_uri, 'insdcref:author', quote(author)) if author
+      end
+      puts triple(@reference_uri, 'insdcref:journal', quote(ref.journal)) if ref.journal
+      puts triple(@reference_uri, 'insdcref:volume', quote(ref.volume)) unless ref.volume.to_s.empty?
+      puts triple(@reference_uri, 'insdcref:issue', quote(ref.issue)) unless ref.issue.to_s.empty?
+      puts triple(@reference_uri, 'insdcref:pages', quote(ref.pages)) unless ref.pages.to_s.empty?
+      puts triple(@reference_uri, 'insdcref:year', quote(ref.year)) unless ref.year.to_s.empty?
+      puts triple(@reference_uri, 'insdcref:medline', quote(ref.medline)) unless ref.medline.to_s.empty?
+      puts triple(@reference_uri, 'insdcref:pubmed', quote(ref.pubmed)) unless ref.pubmed.to_s.empty?
+      ref.comments.each do |comment|
+        puts triple(@reference_uri, 'insdcref:comments', quote(comment)) unless comment.to_s.empty?
+      end if ref.comments
+      if pmid = ref.pubmed
+        if pmid.length > 0
+          xref(@entry_uri, 'PubMed', pmid)
+        end
+      end
+      count += 1
+    end
+  end
+
+  def new_reference_uri(count)
+    "<#{@sequence_id}#reference.#{count}>"
+  end
+
+  def sequence_comment(comment)
+    puts triple(@entry_uri, 'insdc:comment', quote(comment))
   end
 
   ###
@@ -442,25 +559,28 @@ class INSDC2RDF
   ###
 
   def parse_source
-    # Use @sequence_id for @source_id
-    @source_id = @sequence_id
-
     hash = @source.to_hash
-    source_location(@source.position)
+    region_id, locations = source_location(@source.position)
+    from, to = locations.span
+    @source_uri = new_feature_uri(@source.feature, from, to, locations.first.strand)
+
     source_link(hash["db_xref"])
     hash.delete("db_xref")
     source_qualifiers(hash)
   end
 
   def source_location(pos)
-    loc_id, = new_location(pos)
-    puts triple(@source_id, "faldo:location", loc_id)
+    new_location(@sequence_uri, pos)
   end
 
   def source_link(links)
     links.each do |link|
       db, entry_id = link.split(':', 2)
-      xref(@source_id, db, entry_id)
+      xref(@source_uri, db, entry_id)
+      if db == "taxon"
+        @taxonomy_id = entry_id
+        puts triple(@sequence_uri, "obo:RO_0002162", "<http://identifiers.org/taxonomy/#{@taxonomy_id}>") + "  # RO:in taxon"
+      end
     end
   end
 
@@ -468,13 +588,13 @@ class INSDC2RDF
     hash.each do |qual, vals|
       vals.each do |val|
         if val == true
-          puts triple(@source_id, "insdc:#{qual}", true)
+          puts triple(@source_uri, "insdc:#{qual}", true)
         else        
           data = val.to_s.gsub(/\s+/, ' ').strip
           if data[/^\d+$/]
-            puts triple(@source_id, "insdc:#{qual}", data)
+            puts triple(@source_uri, "insdc:#{qual}", data)
           else
-            puts triple(@source_id, "insdc:#{qual}", quote(data))
+            puts triple(@source_uri, "insdc:#{qual}", quote(data))
           end
         end
       end
@@ -490,29 +610,22 @@ class INSDC2RDF
     genes = @features.select {|x| x.feature == "gene"}
   
     genes.each do |gene|
+      @feature_count[gene.feature] += 1
       locations = Bio::Locations.new(gene.position)
-      gene_id = new_feature_uri(@ft_so.so_id("gene"), locations.first.from, locations.last.to, locations.first.strand)
+      from, to = locations.span
+      gene_id = new_feature_uri("gene", from, to, locations.first.strand, @feature_count[gene.feature])
       hash = gene.to_hash
-
-      puts triple(gene_id, "rdf:type", @ft_so.obo_id("gene")) + "  # SO:gene"
-      puts triple(gene_id, "obo:so_part_of", @sequence_id)
-
-      loc_id, _ = new_location(gene.position, {:id => @ft_so.so_id("gene"), :term => "gene"})
-      puts triple(gene_id, "faldo:location", loc_id)
 
       # try to cache gene IDs in the @gene hash for linking with other features (CDS, mRNA etc.)
       if hash["locus_tag"]
         locus_tag = hash["locus_tag"].first
         @gene[locus_tag] = gene_id
-        puts triple(gene_id, "rdfs:label", quote(locus_tag))
       elsif hash["gene"]
         gene = hash["gene"].first
         @gene[gene] = gene_id
-        puts triple(gene_id, "rdfs:label", quote(gene))
       else
-        # [TODO] Where else to find gene name?
+        # [TODO] where else to find gene name?
       end
-      parse_qualifiers(gene_id, hash)
     end
   end
 
@@ -521,24 +634,9 @@ class INSDC2RDF
   ###
 
   def parse_features
-    features = @features.select {|x| x.feature != "gene" }
-
-    features.each do |feat|
+    @features.each do |feat|
       feature = feat.feature
-      locations = Bio::Locations.new(feat.position)
-      feature_id = new_feature_uri(@ft_so.so_id(feature), locations.first.from, locations.last.to, locations.first.strand)
-
-      @feature_count[feature] += 1
-
-      so_id = "SO:0000001"
-      so_term = "region"
-
-      if so_id = @ft_so.so_id(feature)
-        if so_id != "undefined"
-          so_term = @ft_so.so_term(feature)
-        end
-      end
-      puts triple(feature_id, "rdf:type", @ft_so.obo_id(feature)) + "  # SO:#{so_term}"
+      position = feat.position
 
       # try to link gene-related features (CDS, mRNA etc.) by matching /locus_tag or /gene qualifier values
       hash = feat.to_hash
@@ -553,23 +651,76 @@ class INSDC2RDF
         end
       end
 
-      puts triple(feature_id, "rdfs:label", quote(locus_tag || gene || feature))
-      puts triple(feature_id, "obo:so_part_of", gene_id || @sequence_id)
-
-      # link to exons in join(exon1, exon2, ...)
-      if gene_id
-        feature_type = { :id => "SO:0000147", :term => "exon" }
+      # re-use URI for genes otherwise generate new URI
+      if feature == "gene"
+        feature_id = gene_id
       else
-        feature_type = { :id => so_id, :term => so_term }
-      end
-      loc_id, subparts = new_location(feat.position, feature_type)
-      puts triple(feature_id, "faldo:location", loc_id)
-      unless subparts.empty?
-        #puts triple(feature_id, "obo:so_has_part", "(#{subparts.join(' ')})")  # rdf:List
-        puts triple(feature_id, "sio:SIO_000974", subparts.join(', '))  # sio:has-ordered-part
+        @feature_count[feature] += 1
+        locations = Bio::Locations.new(position)
+        min, max = locations.span
+        strand = locations.first.strand
+        feature_id = new_feature_uri(feature, min, max, strand, @feature_count[feature])
       end
 
+      # add type by Sequence Ontology
+      so_id = "SO:0000001"
+      so_obo_id = "obo:SO_0000001"
+      so_term = "region"
+      ft_id = "Feature"
+      if so_id = @ft_so.so_id(feature)
+        if so_id != "undefined"
+          so_obo_id = @ft_so.obo_id(feature)
+          so_term = @ft_so.so_term(feature)
+          ft_id = @ft_so.ft_id(feature)
+        end
+      end
+
+      # feature types and labels
+      puts triple(feature_id, "rdf:type", "insdc:#{ft_id}")
+      puts triple(feature_id, "rdfs:subClassOf", so_obo_id) + "  # SO:#{so_term}"
+      # to make compatible with Ensembl RDF
+      puts triple(feature_id, "obo:RO_0002162", "<http://identifiers.org/taxonomy/#{@taxonomy_id}>") + "  # RO:in taxon"
+      puts triple(feature_id, "rdfs:label", quote(locus_tag || gene || feature))
+      if locus_tag || gene
+        puts triple(feature_id, "skos:prefLabel", quote(locus_tag || gene))
+        if hash["gene_synonym"]
+          hash["gene_synonym"].first.split(/;\s+/).each do |synonym|
+            puts triple(feature_id, "skos:altLabel", quote(synonym))
+          end
+        end
+      end
+
+      # feature qualifiers
       parse_qualifiers(feature_id, hash)
+
+      # parent-child relationship (gene -> mRNA|CDS|misc_RNA etc.)
+      parent_uri = @sequence_uri
+      if gene_id and gene_id != feature_id
+        parent_uri = gene_id
+        puts triple(feature_id, "sio:SIO_010081", gene_id) + "  # sio:is-transcribed-from"
+        # to make compatible with Ensembl RDF
+        puts triple(feature_id, "rdfs:subClassOf", "obo:SO_0000673") + "  # SO:transcript"
+        puts triple(gene_id, "rdfs:subClassOf", "obo:SO_0000010") + "  # SO:protein_coding"
+      end
+      puts triple(feature_id, "obo:so_part_of", parent_uri)
+
+      # add FALDO location and subparts (exons etc.)
+      region_id, locations = new_location(feature_id, position)
+      if locations.count > 1
+        if gene_id
+          # link to exons in join(exon1, exon2, ...)
+          feature_type = { :id => "obo:SO_0000147", :term => "exon", :ft => "Exon" }
+        else
+          # [TODO] need to confirm that if there are any features having subparts other than exons
+          feature_type = { :id => "obo:SO_0000001", :term => "region", :ft => "Feature" }
+        end
+        sub_parts, sub_ordered_parts = add_subparts(locations, feature_type)
+        #puts triple(feature_id, "obo:so_has_part", "(#{sub_parts.join(' ')})")  # rdf:List
+        # exon URIs
+        puts triple(feature_id, "obo:so_has_part", sub_parts.join(', '))
+        # part URIs
+        puts triple(feature_id, "sio:SIO_000974", sub_ordered_parts.join(', ')) + "  # sio:has-ordered-part"
+      end
     end
     $stderr.puts "Features: #{@feature_count.to_json}"
   end
@@ -647,7 +798,7 @@ if __FILE__ == $0
 
   opts = {
     :seqtype => "SO:sequence",
-    :datasource => "insdc",
+    :datasource => "INSDC",     # Can be RefSeq, INSDC, GenBank, ENA, DDBJ
   }
 
   args.each_option do |name, value|

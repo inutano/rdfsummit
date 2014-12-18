@@ -9,7 +9,7 @@
 #   % wget ftp://ftp.ncbi.nlm.nih.gov/pub/taxonomy/taxdump.tar.gz
 #   % mkdir taxdump
 #   % tar --directory=taxdump -xvf taxdump.tar.gz
-#   % ruby taxdump2owl.rb > taxdump.owl 2> taxcite.ttl
+#   % ruby taxdump2owl.rb > taxonomy.ttl 2> taxcite.ttl
 #
 
 module TurtleHelper
@@ -31,7 +31,7 @@ module TaxonomyOntology
     "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .",
     "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .",
     "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .",
-    #"@prefix dcterms: <http://purl.org/dc/terms/> .",
+    "@prefix dcterms: <http://purl.org/dc/terms/> .",
     #"@prefix sio: <http://semanticscience.org/resource#> .",
     #"@prefix so: <http://purl.org/obo/owl/SO#> .",
     #"@prefix obo: <http://purl.obolibrary.org/obo/> .",
@@ -39,7 +39,12 @@ module TaxonomyOntology
     #"@prefix taxo: <http://taxonomyontology.org/ontology#> .",
     #"@prefix taxo: <http://insdc.org/owl/taxonomy#> .",
     "@prefix taxid: <http://identifiers.org/taxonomy/> .",
+    "@prefix taxddbj: <http://ddbj.nig.ac.jp/ontologies/taxonomy/> .",
     "@prefix taxncbi: <http://www.ncbi.nlm.nih.gov/taxonomy/> .",
+    "@prefix taxobo0: <http://purl.obolibrary.org/obo/NCBITaxon_> .",
+    "@prefix taxobo1: <http://purl.org/obo/owl/NCBITaxon#> .",
+    "@prefix taxobo2: <http://www.berkeleybop.org/ontologies/owl/NCBITaxon#> .",
+    "@prefix taxup: <http://purl.uniprot.org/taxonomy/> .",
     #"@prefix codon: <http://www.ncbi.nlm.nih.gov/Taxonomy/Utils/wprintgc.cgi#> .",
     #"@prefix pmid: <http://pubmed.org/> .",
     "@prefix pubmed: <http://identifiers.org/pubmed/> .",
@@ -51,8 +56,12 @@ module TaxonomyOntology
 
 <>
   a owl:Ontology ;
-  rdfs:comment "Taxonomy ontology generated from NCBI taxdump files" ;
-  owl:versionInfo "#{Time.now.strftime('%Y-%m-%d')}"^^xsd:date .
+  rdfs:label "DDBJ taxonomy ontology" ;
+  rdfs:comment "DDBJ Taxonomy ontology is automatically generated from NCBI taxdump files" ;
+  rdfs:seeAlso <http://www.ncbi.nlm.nih.gov/taxonomy/> ;
+  rdfs:seeAlso <https://github.com/dbcls/rdfsummit/tree/master/taxdump2owl> ;
+  dcterms:license <http://creativecommons.org/licenses/by/4.0/> ;
+  owl:versionInfo "@@VERSION_INFO@@"^^xsd:date .
 
 # properties
 
@@ -498,9 +507,9 @@ END_OF_ONTOLOGY
 
     def initialize(pmid, url, key, text)
       @pmid = pmid.to_i > 0 ? pmid : nil
-      @url = url.length > 0 ? url : nil
-      @key = key.length > 0 ? key : nil
-      @text = text.length > 0 ? text : nil
+      @url = url.to_s.length > 0 ? url : nil
+      @key = key.to_s.length > 0 ? key : nil
+      @text = text.to_s.length > 0 ? text : nil
     end
   end
 
@@ -530,12 +539,12 @@ END_OF_ONTOLOGY
     def parse
       File.open(@filename).each do |line|
         cit_id, cit_key, pubmed_id, medline_id, url, text, taxid_list, = *dmp_split(line)
-        next if (pubmed_id + url + cit_key + text).empty?
+        next if [pubmed_id, url, cit_key, text].map{|x| x.to_s}.join.empty?
         citation = Citation.new(pubmed_id, url, cit_key, text)
         taxid_list.split(/\s+/).each do |tax_id|
           @hash[tax_id] ||= []
           @hash[tax_id] << citation
-        end
+        end if taxid_list
       end
     end
   end
@@ -575,6 +584,7 @@ END_OF_ONTOLOGY
     include TurtleHelper
 
     def initialize(hash = {:nodes => "nodes.dmp", :names => "names.dmp", :merged => "merged.dmp", :citations => "citations.dmp"})
+      ONTOLOGY.sub!("@@VERSION_INFO@@", File.mtime(hash[:nodes]).strftime('%Y-%m-%d'))
       output_header
       @citations = CitationsParser.new(hash[:citations])
       @merged = MergedParser.new(hash[:merged])
@@ -597,7 +607,12 @@ END_OF_ONTOLOGY
 
         puts triple(tax, "a", ":Taxon")
         puts triple(tax, "rdfs:subClassOf", "taxid:#{parent_tax_id}") if tax_id != parent_tax_id
-        puts triple(tax, "rdfs:seeAlso", "taxncbi:#{tax_id}")
+        puts triple(tax, "owl:sameAs", "taxddbj:#{tax_id}")
+        puts triple(tax, "owl:sameAs", "taxncbi:#{tax_id}")
+        puts triple(tax, "owl:sameAs", "taxobo0:#{tax_id}")
+        puts triple(tax, "owl:sameAs", "taxobo1:#{tax_id}")
+        puts triple(tax, "owl:sameAs", "taxobo2:#{tax_id}")
+        puts triple(tax, "rdfs:seeAlso", "taxup:#{tax_id}")
         puts triple(tax, ":rank", ":#{RANK_CLASS[rank]}")
         puts triple(tax, ":geneticCode", ":GeneticCode#{genetic_code_id}")
         puts triple(tax, ":geneticCodeMt", ":GeneticCode#{mitochondrial_genetic_code_id}")
